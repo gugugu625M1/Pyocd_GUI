@@ -28,10 +28,9 @@ class TargetSelector(QWidget):
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self._combo.setCompleter(completer)
 
-        # 默认选中 cortex_m
-        idx = self._combo.findText("cortex_m")
-        if idx >= 0:
-            self._combo.setCurrentIndex(idx)
+        # 默认不选中：generic cortex_m 无法烧录，留空提示用户选择或 Detect
+        self._combo.setCurrentIndex(-1)
+        self._combo.lineEdit().setPlaceholderText("Select or detect target…")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

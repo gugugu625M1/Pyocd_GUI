@@ -13,3 +13,5 @@ venv/
 *.log
 .pytest_cache/
 .ruff_cache/
+.vscode
+uv.lock

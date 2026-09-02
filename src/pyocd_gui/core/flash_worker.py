@@ -29,30 +29,44 @@ class FlashWorker(QThread):
         firmware_path: Path,
         target: str,
         probe_uid: Optional[str] = None,
-        erase: bool = True,
+        erase_mode: str = "chip",
         verify: bool = True,
         connect_mode: str = "under-reset",
         reset_after: bool = True,
+        clock_khz: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._firmware_path = firmware_path
         self._target = target
         self._probe_uid = probe_uid
-        self._erase = erase
+        self._erase_mode = erase_mode
         self._verify = verify
         self._connect_mode = connect_mode
         self._reset_after = reset_after
+        self._clock_khz = clock_khz
 
     # ------------------------------------------------------------------
     def run(self) -> None:
+        if not self._target or self._target.strip().lower() == "cortex_m":
+            self.log.emit(
+                "No target type selected — the generic 'cortex_m' target cannot "
+                "program flash. Pick a target or run Detect first."
+            )
+            self.finished.emit(False)
+            return
+
         try:
+            options = {"smart_flash": False}
+            if self._clock_khz:
+                options["frequency"] = self._clock_khz * 1000
+
             self.log.emit(f"Connecting to target '{self._target}' (mode: {self._connect_mode}) …")
             with ConnectHelper.session_with_chosen_probe(
                 unique_id=self._probe_uid,
                 target_override=self._target,
                 auto_unlock=True,
                 connect_mode=self._connect_mode,
-                options={"smart_flash": False},
+                options=options,
             ) as session:
                 self.log.emit("Connected. Halting target …")
                 session.target.reset_and_halt(reset_type=Target.ResetType.SYSRESETREQ)
@@ -60,7 +74,12 @@ class FlashWorker(QThread):
 
                 programmer = FileProgrammer(
                     session,
-                    chip_erase=("chip" if self._erase else "sector"),
+                    # "smart" → sector erase + smart_flash: pages whose contents
+                    # are unchanged are neither erased nor programmed, but pages
+                    # that changed are still erased. NOT a no-erase mode — pyOCD's
+                    # public API has no true "skip erase before programming".
+                    chip_erase=("sector" if self._erase_mode == "smart" else self._erase_mode),
+                    smart_flash=(True if self._erase_mode == "smart" else None),
                     trust_crc=not self._verify,
                     progress=self._on_progress,
                 )

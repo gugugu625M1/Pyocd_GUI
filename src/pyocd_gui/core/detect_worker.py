@@ -17,10 +17,11 @@ class DetectWorker(QThread):
 
     result = Signal(object, str)  # (Optional[str], str)
 
-    def __init__(self, probe_uid: Optional[str] = None) -> None:
+    def __init__(self, probe_uid: Optional[str] = None, clock_khz: Optional[int] = None) -> None:
         super().__init__()
         self._probe_uid = probe_uid
+        self._clock_khz = clock_khz
 
     def run(self) -> None:
-        target_name, msg = detect_target(self._probe_uid)
+        target_name, msg = detect_target(self._probe_uid, self._clock_khz)
         self.result.emit(target_name, msg)

@@ -1,13 +1,39 @@
-"""Automatic target detection by reading vendor-specific identification registers."""
+"""Automatic target detection by reading vendor-specific identification registers.
 
+The detected part is resolved to a target type name that pyOCD can actually use
+(either a built-in target or one from an installed CMSIS-Pack), so that the name
+can be passed directly to ``target_override`` for flash programming.
+"""
+
+from functools import lru_cache
 from typing import Optional
 
 from pyocd.core.helpers import ConnectHelper
 from pyocd.core.target import Target
+from pyocd.target import TARGET
+
+# ---------------------------------------------------------------------------
+# STM32 DBGMCU_IDCODE base addresses, by device generation.
+# The first readable register whose DEV_ID is known wins.
+#   legacy (F0/F1/F2/F3/F4/F7/L0/L1/L4/G0/G4) : 0xE0042000
+#   H7                                        : 0x5C001000
+#   new    (L5/U5/H5/H7RS/WBA)                : 0xE0044000
+# ---------------------------------------------------------------------------
+_DBGMCU_IDCODE_ADDRS = (0xE0042000, 0x5C001000, 0xE0044000)
+
+# STM32 flash size register addresses, tried in order until a sane value reads.
+#   0x1FFFF7E0 — F0/F1/F3/L1      0x1FFF7A22 — F2/F4
+#   0x1FFF75E0 — G0/G4/L4         0x1FF0F442 — F7
+#   0x1FF1E880 — H7
+_FLASH_SIZE_ADDRS = (0x1FFFF7E0, 0x1FFF7A22, 0x1FFF75E0, 0x1FF0F442, 0x1FF1E880)
+
+_FLASH_KB_MIN, _FLASH_KB_MAX = 16, 4096
 
 # ---------------------------------------------------------------------------
 # STM32 DBGMCU_IDCODE → pyocd target name map
-# Key: (DEV_ID, flash_kb)   Value: pyocd target type name
+# Key: (DEV_ID, flash_kb)   Value: base part name.
+# Base names are resolved to an exact, installed pyOCD target name at runtime
+# (pack names carry temperature/package suffixes, e.g. stm32h743zi → stm32h743zitx).
 # ---------------------------------------------------------------------------
 _STM32_TARGETS: dict[tuple[int, int], str] = {
     # F0
@@ -68,6 +94,7 @@ _STM32_TARGETS: dict[tuple[int, int], str] = {
     (0x468, 128):  "stm32g431rb",
     (0x469, 512):  "stm32g474re",
     # H7
+    (0x450, 1024): "stm32h743zg",
     (0x450, 2048): "stm32h743zi",
     # WB
     (0x495, 1024): "stm32wb55rg",
@@ -102,73 +129,133 @@ _STM32_FAMILY: dict[int, str] = {
 }
 
 
-def detect_target(probe_uid: Optional[str] = None) -> tuple[Optional[str], str]:
+def detect_target(
+    probe_uid: Optional[str] = None, clock_khz: Optional[int] = None
+) -> tuple[Optional[str], str]:
     """Connect with generic cortex_m, read vendor ID registers, return (target_name, info_msg).
+
+    ``target_name`` is guaranteed to be a usable pyOCD target type (built-in or
+    from an installed CMSIS-Pack), suitable for ``target_override``. If the chip
+    is identified but its target support is not installed, ``None`` is returned
+    with an explanatory message.
 
     Returns
     -------
     target_name : str or None
-        pyocd target name if identified, None otherwise.
+        pyocd target name if identified and usable, None otherwise.
     info_msg : str
         Human-readable description of what was found.
     """
     try:
+        options = {"smart_flash": False}
+        if clock_khz:
+            options["frequency"] = clock_khz * 1000
+
         with ConnectHelper.session_with_chosen_probe(
             unique_id=probe_uid,
             target_override="cortex_m",
             auto_unlock=False,
             connect_mode="under-reset",
-            options={"smart_flash": False},
+            options=options,
         ) as session:
             session.target.reset_and_halt(reset_type=Target.ResetType.SYSRESETREQ)
 
-            # --- STM32: DBGMCU_IDCODE at 0xE0042000 ---
-            try:
-                idcode = session.target.read32(0xE0042000)
+            # --- STM32: DBGMCU_IDCODE (address differs by device generation) ---
+            read_errors: list[str] = []
+            for idcode_addr in _DBGMCU_IDCODE_ADDRS:
+                try:
+                    idcode = session.target.read32(idcode_addr)
+                except Exception as exc:
+                    read_errors.append(f"{idcode_addr:#010x}: {type(exc).__name__}")
+                    continue
+
                 dev_id = idcode & 0xFFF
                 rev_id = (idcode >> 16) & 0xFFFF
+                if dev_id not in _STM32_FAMILY:
+                    continue  # readable but not a known STM32 — try next address
 
-                if dev_id in _STM32_FAMILY:
-                    # Read flash size (0x1FFFF7E0 for F0/F1/F3/L1, 0x1FFF7A22 for F2/F4/F7/H7)
-                    flash_kb = _read_flash_size(session.target, dev_id)
+                return _describe_stm32(session.target, dev_id, rev_id)
 
-                    target_name = _STM32_TARGETS.get((dev_id, flash_kb))
-                    family = _STM32_FAMILY[dev_id]
-                    flash_str = f"{flash_kb} KB" if flash_kb else "unknown size"
-                    rev_str = f"REV=0x{rev_id:04X}"
-
-                    if target_name:
-                        msg = (
-                            f"Detected: {family}, Flash {flash_str}, {rev_str} "
-                            f"→ {target_name}"
-                        )
-                    else:
-                        target_name = None
-                        msg = (
-                            f"Detected: {family}, Flash {flash_str}, {rev_str} "
-                            f"(no exact match — select manually)"
-                        )
-                    return target_name, msg
-            except Exception:
-                pass  # not STM32 or register not accessible
-
-            return None, "Could not identify target (vendor-specific registers not readable)"
+            return (
+                None,
+                "Could not identify target (no known STM32 DBGMCU_IDCODE readable"
+                + (f"; errors: {'; '.join(read_errors)}" if read_errors else "")
+                + ")",
+            )
 
     except Exception as exc:
         return None, f"Detection failed: {exc}"
 
 
-def _read_flash_size(target, dev_id: int) -> Optional[int]:
-    """Read flash size in KB from the appropriate register for the detected family."""
-    # STM32F0/F1/F3/L1 — 0x1FFFF7E0
-    # STM32F2/F4       — 0x1FFF7A22  (16-bit, word-aligned read → mask lower 16)
-    # STM32F7/H7/G0/G4/L4 — 0x1FF0F442 or 0x1FFF75E0
-    # Fallback: try known addresses in order until a sane value is read
-    candidates = [0x1FFFF7E0, 0x1FFF7A22, 0x1FFF75E0, 0x1FF0F442]
-    for addr in candidates:
+def _describe_stm32(target, dev_id: int, rev_id: int) -> tuple[Optional[str], str]:
+    """Look up the detected STM32 and resolve it to a usable pyOCD target name."""
+    flash_kb = _read_flash_size(target)
+    family = _STM32_FAMILY[dev_id]
+    flash_str = f"{flash_kb} KB" if flash_kb else "unknown size"
+    rev_str = f"REV=0x{rev_id:04X}"
+
+    base = _STM32_TARGETS.get((dev_id, flash_kb))
+    if base is None:
+        return (
+            None,
+            f"Detected: {family}, Flash {flash_str}, {rev_str} "
+            f"(no exact match — select manually)",
+        )
+
+    resolved = resolve_target_name(base)
+    if resolved is not None:
+        return resolved, f"Detected: {family}, Flash {flash_str}, {rev_str} → {resolved}"
+
+    return (
+        None,
+        f"Detected: {family}, Flash {flash_str}, {rev_str}, but target support for "
+        f"'{base}' is not installed — run 'pyocd pack install {base}' "
+        f"or select a target manually",
+    )
+
+
+def resolve_target_name(base: str) -> Optional[str]:
+    """Resolve a base part name to an exact, installed pyOCD target type name.
+
+    Pack target names carry temperature/package suffixes (e.g. ``stm32h743zi``
+    is installed as ``stm32h743zitx``), so an exact match is preferred and a
+    prefix match is accepted. Flash algorithms are identical across those
+    variants, so any matching variant programs the device correctly.
+
+    Returns None when neither a built-in target nor an installed pack provides
+    support for the part.
+    """
+    base = base.lower()
+    if base in TARGET:
+        return base
+
+    parts = _installed_part_numbers()
+    exact = [p for p in parts if p == base]
+    if exact:
+        return exact[0]
+    prefixed = [p for p in parts if p.startswith(base)]
+    if prefixed:
+        return prefixed[0]
+    return None
+
+
+@lru_cache(maxsize=1)
+def _installed_part_numbers() -> tuple[str, ...]:
+    """Lower-case part numbers of all targets from managed (installed) CMSIS-Packs."""
+    try:
+        from pyocd.target.pack.pack_target import ManagedPacks
+
+        return tuple(dev.part_number.lower() for dev in ManagedPacks.get_installed_targets())
+    except Exception:
+        return ()
+
+
+def _read_flash_size(target) -> Optional[int]:
+    """Read flash size in KB by trying known STM32 flash size register addresses."""
+    for addr in _FLASH_SIZE_ADDRS:
         try:
             val = target.read16(addr)
-            if 16 <= val <= 4096:  # sanity: 16 KB – 4 MB
+            if _FLASH_KB_MIN <= val <= _FLASH_KB_MAX:  # sanity: 16 KB – 4 MB
                 return val
         except Exception:
             continue
