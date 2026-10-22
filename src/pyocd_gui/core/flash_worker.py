@@ -9,6 +9,8 @@ from pyocd.core.helpers import ConnectHelper
 from pyocd.core.target import Target
 from pyocd.flash.file_programmer import FileProgrammer
 
+from pyocd_gui.core.firmware import FirmwareImage, resolve_bin_addresses, validate_images
+
 
 class FlashWorker(QThread):
     """Run pyOCD flash programming in a background thread.
@@ -26,7 +28,7 @@ class FlashWorker(QThread):
 
     def __init__(
         self,
-        firmware_path: Path,
+        firmware_path: Path | None,
         target: str,
         probe_uid: Optional[str] = None,
         erase_mode: str = "chip",
@@ -34,9 +36,12 @@ class FlashWorker(QThread):
         connect_mode: str = "under-reset",
         reset_after: bool = True,
         clock_khz: Optional[int] = None,
+        images: list[FirmwareImage] | None = None,
     ) -> None:
         super().__init__()
-        self._firmware_path = firmware_path
+        self._images = tuple(images) if images is not None else (
+            (FirmwareImage(firmware_path),) if firmware_path is not None else ()
+        )
         self._target = target
         self._probe_uid = probe_uid
         self._erase_mode = erase_mode
@@ -56,7 +61,8 @@ class FlashWorker(QThread):
             return
 
         try:
-            options = {"smart_flash": False}
+            validate_images(self._images)
+            options = {"smart_flash": False, "resume_on_disconnect": False}
             if self._clock_khz:
                 options["frequency"] = self._clock_khz * 1000
 
@@ -68,6 +74,7 @@ class FlashWorker(QThread):
                 connect_mode=self._connect_mode,
                 options=options,
             ) as session:
+                images = resolve_bin_addresses(self._images, session.target.memory_map)
                 self.log.emit("Connected. Halting target …")
                 session.target.reset_and_halt(reset_type=Target.ResetType.SYSRESETREQ)
                 self.log.emit("Target halted. Starting flash operation …")
@@ -81,9 +88,19 @@ class FlashWorker(QThread):
                     chip_erase=("sector" if self._erase_mode == "smart" else self._erase_mode),
                     smart_flash=(True if self._erase_mode == "smart" else None),
                     trust_crc=not self._verify,
+                    keep_unwritten=True,
                     progress=self._on_progress,
                 )
-                programmer.program(str(self._firmware_path))
+                for image in images:
+                    self.log.emit(
+                        f"Buffering {image.path.name}"
+                        + (f" at 0x{image.base_address:08X}" if image.base_address is not None else "")
+                    )
+                    arguments = {"base_address": image.base_address} if image.base_address is not None else {}
+                    programmer.add_file(
+                        str(image.path), file_format=image.path.suffix.lower()[1:], **arguments
+                    )
+                programmer.commit()
 
                 if self._reset_after:
                     session.target.reset(reset_type=Target.ResetType.SYSRESETREQ)

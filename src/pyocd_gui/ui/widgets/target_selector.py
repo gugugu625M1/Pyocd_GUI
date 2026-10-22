@@ -2,11 +2,17 @@
 
 from PySide6.QtWidgets import QComboBox, QLineEdit, QWidget, QHBoxLayout
 
-from pyocd.target import TARGET
+from pyocd.target import TARGET, normalise_target_type_name
+from pyocd.target.pack.pack_target import ManagedPacks
 
 
 def _all_targets() -> list[str]:
-    return sorted(TARGET.keys())
+    targets = set(TARGET)
+    targets.update(
+        normalise_target_type_name(device.part_number)
+        for device in ManagedPacks.get_installed_targets()
+    )
+    return sorted(targets)
 
 
 class TargetSelector(QWidget):
@@ -38,6 +44,15 @@ class TargetSelector(QWidget):
 
     def current_target(self) -> str:
         return self._combo.currentText().strip()
+
+    def refresh_targets(self) -> None:
+        current = self.current_target()
+        targets = _all_targets()
+        self._combo.clear()
+        self._combo.addItems(targets)
+        self._combo.completer().model().setStringList(targets)
+        self._combo.setCurrentIndex(-1)
+        self._combo.setEditText(current)
 
     def set_target(self, name: str) -> None:
         idx = self._combo.findText(name)

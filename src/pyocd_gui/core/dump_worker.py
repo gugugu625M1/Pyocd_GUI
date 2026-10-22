@@ -59,7 +59,7 @@ class DumpWorker(QThread):
             return
 
         try:
-            options = {"smart_flash": False}
+            options = {"smart_flash": False, "resume_on_disconnect": False}
             if self._clock_khz:
                 options["frequency"] = self._clock_khz * 1000
 
@@ -67,7 +67,7 @@ class DumpWorker(QThread):
             with ConnectHelper.session_with_chosen_probe(
                 unique_id=self._probe_uid,
                 target_override=self._target,
-                auto_unlock=True,
+                auto_unlock=False,
                 connect_mode=self._connect_mode,
                 options=options,
             ) as session:
@@ -89,10 +89,17 @@ class DumpWorker(QThread):
 
                 data = bytearray()
                 chunk_count = (length + self._CHUNK_SIZE - 1) // self._CHUNK_SIZE
+                if session.target.get_state() != Target.State.HALTED:
+                    raise RuntimeError("Target did not remain halted before Flash read.")
                 for index in range(chunk_count):
                     offset = index * self._CHUNK_SIZE
                     size = min(self._CHUNK_SIZE, length - offset)
                     block = session.target.read_memory_block8(start + offset, size)
+                    if session.target.get_state() != Target.State.HALTED:
+                        raise RuntimeError(
+                            "Target resumed or reset during Flash read; no dump was saved. "
+                            "If a watchdog is active, configure debug freeze before retrying."
+                        )
                     data += bytes(block)
                     self.progress.emit(int((index + 1) * 100 / chunk_count))
 
@@ -120,7 +127,7 @@ class DumpWorker(QThread):
             from intelhex import IntelHex  # provided by pyocd's dependencies
 
             ihex = IntelHex()
-            ihex.putsz(base_addr, data)
+            ihex.frombytes(data, offset=base_addr)
             ihex.write_hex_file(str(path))
         else:
             path.write_bytes(data)

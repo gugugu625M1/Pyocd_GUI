@@ -15,11 +15,12 @@ from pyocd.target import TARGET
 # ---------------------------------------------------------------------------
 # STM32 DBGMCU_IDCODE base addresses, by device generation.
 # The first readable register whose DEV_ID is known wins.
-#   legacy (F0/F1/F2/F3/F4/F7/L0/L1/L4/G0/G4) : 0xE0042000
+#   G0                                        : 0x40015800
+#   legacy (F0/F1/F2/F3/F4/F7/L0/L1/L4/G4)   : 0xE0042000
 #   H7                                        : 0x5C001000
 #   new    (L5/U5/H5/H7RS/WBA)                : 0xE0044000
 # ---------------------------------------------------------------------------
-_DBGMCU_IDCODE_ADDRS = (0xE0042000, 0x5C001000, 0xE0044000)
+_DBGMCU_IDCODE_ADDRS = (0x40015800, 0xE0042000, 0x5C001000, 0xE0044000)
 
 # STM32 flash size register addresses, tried in order until a sane value reads.
 #   0x1FFFF7E0 — F0/F1/F3/L1      0x1FFF7A22 — F2/F4
@@ -89,7 +90,7 @@ _STM32_TARGETS: dict[tuple[int, int], str] = {
     # G0
     (0x460, 32):   "stm32g031c8",
     (0x460, 64):   "stm32g031k8",
-    (0x467, 64):   "stm32g0b1re",
+    (0x467, 512):  "stm32g0b1ret",
     # G4
     (0x468, 128):  "stm32g431rb",
     (0x469, 512):  "stm32g474re",
@@ -162,6 +163,7 @@ def detect_target(
 
             # --- STM32: DBGMCU_IDCODE (address differs by device generation) ---
             read_errors: list[str] = []
+            unknown_idcodes: list[str] = []
             for idcode_addr in _DBGMCU_IDCODE_ADDRS:
                 try:
                     idcode = session.target.read32(idcode_addr)
@@ -172,6 +174,7 @@ def detect_target(
                 dev_id = idcode & 0xFFF
                 rev_id = (idcode >> 16) & 0xFFFF
                 if dev_id not in _STM32_FAMILY:
+                    unknown_idcodes.append(f"{idcode_addr:#010x}=0x{idcode:08X}")
                     continue  # readable but not a known STM32 — try next address
 
                 return _describe_stm32(session.target, dev_id, rev_id)
@@ -179,6 +182,7 @@ def detect_target(
             return (
                 None,
                 "Could not identify target (no known STM32 DBGMCU_IDCODE readable"
+                + (f"; unknown IDCODEs: {', '.join(unknown_idcodes)}" if unknown_idcodes else "")
                 + (f"; errors: {'; '.join(read_errors)}" if read_errors else "")
                 + ")",
             )
